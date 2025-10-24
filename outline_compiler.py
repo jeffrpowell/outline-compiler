@@ -204,6 +204,43 @@ class OutlineCompiler:
             if doc_id:
                 self.doc_uuid_to_anchor[doc_id] = f"doc-{i}"
     
+    def _normalize_list_indentation(self, text: str) -> str:
+        """
+        Normalize list indentation from 2 spaces to 4 spaces.
+        
+        The Python markdown library requires 4 spaces for nested lists,
+        but Outline uses 2 spaces. This function converts 2-space indentation
+        to 4-space indentation for proper nested list rendering.
+        
+        Args:
+            text: Markdown text with 2-space list indentation
+            
+        Returns:
+            Markdown text with 4-space list indentation
+        """
+        lines = text.split('\n')
+        normalized_lines = []
+        
+        for line in lines:
+            # Check if line starts with spaces followed by a list marker (* or -)
+            if line and (line.lstrip().startswith('* ') or line.lstrip().startswith('- ')):
+                # Count leading spaces
+                leading_spaces = len(line) - len(line.lstrip())
+                
+                # If there are leading spaces (indicating nesting), double them
+                if leading_spaces > 0:
+                    # Double the indentation
+                    new_indent = ' ' * (leading_spaces * 2)
+                    normalized_lines.append(new_indent + line.lstrip())
+                else:
+                    # Top-level item, keep as is
+                    normalized_lines.append(line)
+            else:
+                # Not a list item, keep as is
+                normalized_lines.append(line)
+        
+        return '\n'.join(normalized_lines)
+    
     def _extract_mermaid_blocks(self, text: str) -> tuple:
         """
         Extract mermaid code blocks and replace with placeholders.
@@ -394,11 +431,22 @@ class OutlineCompiler:
             '        .document-content {',
             '            padding-left: 20px;',
             '        }',
-            '        .depth-1 { padding-left: 20px; }',
-            '        .depth-2 { padding-left: 40px; }',
-            '        .depth-3 { padding-left: 60px; }',
-            '        .depth-4 { padding-left: 80px; }',
-            '        .depth-5 { padding-left: 100px; }',
+            '        .document-content ul {',
+            '            margin: 10px 0;',
+            '            padding-left: 30px;',
+            '        }',
+            '        .document-content ol {',
+            '            margin: 10px 0;',
+            '            padding-left: 30px;',
+            '        }',
+            '        .document-content li {',
+            '            margin: 5px 0;',
+            '        }',
+            '        .depth-1 { margin-left: 20px; }',
+            '        .depth-2 { margin-left: 40px; }',
+            '        .depth-3 { margin-left: 60px; }',
+            '        .depth-4 { margin-left: 80px; }',
+            '        .depth-5 { margin-left: 100px; }',
             '        pre {',
             '            background: #f5f5f5;',
             '            padding: 15px;',
@@ -456,16 +504,21 @@ class OutlineCompiler:
             '        .toc h2 {',
             '            margin-top: 0;',
             '        }',
-            '        .toc ul {',
+            '        .toc > ul {',
             '            list-style-type: none;',
             '            padding-left: 0;',
+            '        }',
+            '        .toc ul ul {',
+            '            padding-left: 30px;',
             '        }',
             '        .toc li {',
             '            margin: 5px 0;',
             '        }',
-            '        .toc .depth-1 { padding-left: 20px; }',
-            '        .toc .depth-2 { padding-left: 40px; }',
-            '        .toc .depth-3 { padding-left: 60px; }',
+            '        .toc .depth-1 { margin-left: 20px; }',
+            '        .toc .depth-2 { margin-left: 40px; }',
+            '        .toc .depth-3 { margin-left: 60px; }',
+            '        .toc .depth-4 { margin-left: 80px; }',
+            '        .toc .depth-5 { margin-left: 100px; }',
             '        .mermaid {',
             '            background: #f9f9f9;',
             '            padding: 20px;',
@@ -503,6 +556,7 @@ class OutlineCompiler:
             '    <div class="header">',
             f'        <h1>{self._escape_html(collection_name)}</h1>',
             f'        <div class="meta">Compiled on {timestamp}</div>',
+            f'        <div class="meta">Derived from content located at <a href="https://outline.jeffpowell.dev">https://outline.jeffpowell.dev</a></div>',
             '    </div>',
         ]
         
@@ -535,6 +589,10 @@ class OutlineCompiler:
             updated_at = doc.get('updatedAt', '')
             created_by = doc.get('createdBy', {})
             author_name = created_by.get('name', 'Unknown')
+            
+            # Normalize list indentation (2 spaces -> 4 spaces)
+            if text:
+                text = self._normalize_list_indentation(text)
             
             # Extract mermaid blocks before markdown conversion
             mermaid_blocks = []
