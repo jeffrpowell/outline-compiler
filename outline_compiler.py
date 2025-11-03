@@ -10,7 +10,10 @@ import sys
 import requests
 import re
 import time
-from typing import List, Dict, Optional
+import os
+from pathlib import Path
+from urllib.parse import urlparse, unquote
+from typing import List, Dict, Optional, Set, Tuple
 import markdown
 from datetime import datetime
 
@@ -46,6 +49,10 @@ class OutlineCompiler:
         ])
         # Mapping of document UUID to anchor ID in compiled HTML
         self.doc_uuid_to_anchor = {}
+        # Track downloaded attachments: URL -> local filename
+        self.downloaded_attachments = {}
+        # Output directory for the compilation
+        self.output_dir = None
     
     def _make_request(self, endpoint: str, data: Optional[Dict] = None) -> Dict:
         """
@@ -317,13 +324,271 @@ class OutlineCompiler:
         
         return re.sub(pattern, replace_mention, html)
     
+    def _process_file_attachments(self, html: str) -> str:
+        """
+        Process file attachment tags in HTML by removing literal \n and adding proper newlines.
+        
+        Outline's markdown for file attachments can contain literal backslash-n characters
+        that need to be removed, and we need to add proper newlines after attachment tags.
+        
+        Args:
+            html: HTML content with file attachment tags
+            
+        Returns:
+            HTML with cleaned up file attachment formatting
+        """
+        # Remove literal \n characters (the two-character sequence backslash-n)
+        html = html.replace('\\n', '')
+        
+        # Add newlines after file attachment links (common pattern: <a href="...">filename</a>)
+        # This pattern matches attachment links and adds a <br> tag after them for proper spacing
+        # Pattern looks for links that point to attachments directory
+        html = re.sub(r'(<a[^>]*href=["\']attachments/[^"\']+["\'][^>]*>.*?</a>)', r'\1<br>\n', html)
+        
+        return html
+    
+    def _clean_url(self, url: str) -> str:
+        """
+        Clean a URL by removing markdown image size syntax and extra quotes/whitespace.
+        
+        Args:
+            url: URL to clean
+            
+        Returns:
+            Cleaned URL
+        """
+        original_url = url
+        url = url.strip()
+        
+        # Remove markdown image size syntax (e.g., " =709x696" or "=709x696")
+        url = re.sub(r'\s*=\s*\d+\s*x\s*\d+\s*$', '', url)
+        
+        # Remove markdown image alignment syntax (e.g., "left-50 or "center)
+        # This handles patterns like: "left-50 =184x38 or "center =100x100
+        url = re.sub(r'\s*"[a-z]+-?\d*\s*=\s*\d+\s*x\s*\d+\s*$', '', url)
+        url = re.sub(r'\s*"[a-z]+-?\d*\s*$', '', url)
+        
+        # Remove any trailing quotes, whitespace, or other common artifacts
+        url = url.strip('"').strip("'").strip()
+        
+        # Remove any trailing spaces or quotes that might be inside the URL
+        url = re.sub(r'["\s\']+$', '', url)
+        
+        # Log if URL was changed
+        if self.debug and original_url != url:
+            print(f"DEBUG: Cleaned URL from '{original_url}' to '{url}'", file=sys.stderr)
+        return url
+    
+    def _extract_attachment_urls(self, text: str) -> Set[str]:
+        """
+        Extract all attachment URLs from markdown text.
+        Looks for image URLs and file links that point to the Outline instance.
+        
+        Args:
+            text: Markdown text
+            
+        Returns:
+            Set of URLs
+        """
+        urls = set()
+        
+        # Pattern for markdown images: ![alt](url)
+        # Handle markdown image size syntax like =WIDTHxHEIGHT which appears after the URL
+        image_pattern = r'!\[([^\]]*)\]\(([^)]+)\)'
+        for match in re.finditer(image_pattern, text):
+            url = self._clean_url(match.group(2))
+            # Only include URLs from the same domain as the API
+            if self._is_attachment_url(url):
+                urls.add(url)
+        
+        # Pattern for markdown links: [text](url)
+        link_pattern = r'\[([^\]]+)\]\(([^)]+)\)'
+        for match in re.finditer(link_pattern, text):
+            url = self._clean_url(match.group(2))
+            # Check if it's an attachment link (not a mention:// or http:// external link)
+            if self._is_attachment_url(url):
+                urls.add(url)
+        
+        # Also check for direct HTML img tags in the markdown
+        html_img_pattern = r'<img[^>]+src=["\']([^"\'\']+)["\']'
+        for match in re.finditer(html_img_pattern, text):
+            url = self._clean_url(match.group(1))
+            if self._is_attachment_url(url):
+                urls.add(url)
+        
+        return urls
+    
+    def _is_attachment_url(self, url: str) -> bool:
+        """
+        Check if a URL is likely an attachment from the Outline instance.
+        
+        Args:
+            url: URL to check
+            
+        Returns:
+            True if the URL appears to be an attachment
+        """
+        # Skip mention:// protocol links
+        if url.startswith('mention://'):
+            return False
+        
+        # Skip mailto: links
+        if url.startswith('mailto:'):
+            return False
+        
+        # Skip external http/https links that don't match our API domain
+        if url.startswith('http://') or url.startswith('https://'):
+            parsed_api = urlparse(self.api_url)
+            parsed_url = urlparse(url)
+            
+            # If it's from the same domain or a CDN/storage domain, it's likely an attachment
+            # This catches both direct domain matches and common patterns like:
+            # - app.getoutline.com -> s3.amazonaws.com (attachments)
+            # - outline.example.com -> storage.example.com
+            api_host = parsed_api.netloc
+            url_host = parsed_url.netloc
+            
+            # Check if URL is from the same domain or contains "attachment" in the path
+            if api_host in url_host or url_host in api_host or '/api/attachments' in url:
+                return True
+            
+            # Check for common storage/CDN patterns
+            if any(pattern in url_host.lower() for pattern in ['amazonaws', 's3', 'cloudfront', 'storage', 'cdn']):
+                return True
+            
+            return False
+        
+        # Relative URLs are considered attachments
+        return True
+    
+    def _download_attachment(self, url: str, attachments_dir: Path) -> Optional[str]:
+        """
+        Download an attachment and save it to the attachments directory.
+        
+        Args:
+            url: URL of the attachment (can be relative or absolute)
+            attachments_dir: Directory to save attachments
+            
+        Returns:
+            Local filename if successful, None otherwise
+        """
+        if url in self.downloaded_attachments:
+            return self.downloaded_attachments[url]
+        
+        try:
+            # Make sure the URL is clean before processing
+            clean_url = self._clean_url(url)
+            
+            # Convert relative URLs to absolute URLs
+            download_url = clean_url
+            if clean_url.startswith('/'):
+                # Relative URL - prepend the base URL (without /api suffix)
+                parsed_api = urlparse(self.api_url)
+                base_url = f"{parsed_api.scheme}://{parsed_api.netloc}"
+                download_url = base_url + clean_url
+                if self.debug:
+                    print(f"DEBUG: Converted relative URL {clean_url} to {download_url}", file=sys.stderr)
+            
+            # Generate a safe filename
+            parsed = urlparse(clean_url)
+            filename = os.path.basename(unquote(parsed.path))
+            
+            # For API endpoints like attachments.redirect, use the ID from query params
+            if 'attachments.redirect' in clean_url:
+                import urllib.parse
+                query_params = urllib.parse.parse_qs(parsed.query)
+                if 'id' in query_params:
+                    attachment_id = query_params['id'][0]
+                    # We'll get the actual filename from the response headers
+                    filename = f"attachment_{attachment_id[:8]}"
+            
+            # If no filename, generate one from the URL
+            if not filename or filename == '/':
+                import hashlib
+                url_hash = hashlib.md5(clean_url.encode()).hexdigest()[:8]
+                filename = f"attachment_{url_hash}"
+            
+            # Ensure filename is safe
+            filename = re.sub(r'[^\w\s\-\.]', '_', filename)
+            
+            # Make filename unique if it already exists
+            base_name, ext = os.path.splitext(filename)
+            counter = 1
+            final_path = attachments_dir / filename
+            while final_path.exists():
+                filename = f"{base_name}_{counter}{ext}"
+                final_path = attachments_dir / filename
+                counter += 1
+            
+            # Download the file
+            print(f"  Downloading attachment: {filename}")
+            if self.debug:
+                print(f"DEBUG: Using download URL: {download_url}", file=sys.stderr)
+            
+            # Use the API key for authentication if it's an API endpoint
+            headers = {}
+            if '/api/attachments' in download_url:
+                headers = self.headers
+                if self.debug:
+                    print(f"DEBUG: Using API authentication headers", file=sys.stderr)
+            
+            # Allow redirects for attachments.redirect endpoint
+            response = requests.get(download_url, headers=headers, stream=True, timeout=30, allow_redirects=True)
+            response.raise_for_status()
+            
+            # Try to get a better filename from Content-Disposition header
+            if 'Content-Disposition' in response.headers:
+                import re as regex
+                content_disp = response.headers['Content-Disposition']
+                filename_match = regex.search(r'filename[^;=\n]*=["\']?([^"\';\n]+)', content_disp)
+                if filename_match:
+                    suggested_filename = filename_match.group(1)
+                    # Use the extension from the suggested filename if we don't have one
+                    if not ext and '.' in suggested_filename:
+                        ext = '.' + suggested_filename.rsplit('.', 1)[1]
+                        filename = base_name + ext
+                        final_path = attachments_dir / filename
+            
+            # Save the file
+            with open(final_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            
+            # Store both the original URL and the clean URL in the mapping
+            # This ensures we can replace both versions in the document
+            self.downloaded_attachments[url] = filename
+            if url != clean_url:
+                self.downloaded_attachments[clean_url] = filename
+            return filename
+            
+        except Exception as e:
+            print(f"  Warning: Failed to download attachment from {url}: {e}", file=sys.stderr)
+            return None
+    
+    def _replace_attachment_urls(self, text: str, is_html: bool = False) -> str:
+        """
+        Replace attachment URLs with local references.
+        
+        Args:
+            text: Text content (markdown or HTML)
+            is_html: Whether the text is HTML (True) or markdown (False)
+            
+        Returns:
+            Text with replaced URLs
+        """
+        for original_url, local_filename in self.downloaded_attachments.items():
+            local_path = f"attachments/{local_filename}"
+            text = text.replace(original_url, local_path)
+        
+        return text
+    
     def compile_collection(self, collection_id: str, output_file: str):
         """
-        Compile all documents from a collection into a single HTML file.
+        Compile all documents from a collection into a single HTML file with attachments.
         
         Args:
             collection_id: UUID of the collection
-            output_file: Path to output HTML file
+            output_file: Path to output HTML file (or directory if attachments are present)
         """
         print(f"Fetching collection information...")
         collection = self.get_collection_info(collection_id)
@@ -341,25 +606,64 @@ class OutlineCompiler:
         
         # Fetch all documents
         documents_with_content = []
+        all_attachment_urls = set()
+        
         for i, (doc_id, title, depth) in enumerate(doc_list, 1):
             print(f"  [{i}/{len(doc_list)}] {title}")
             try:
                 doc = self.get_document_info(doc_id)
                 documents_with_content.append((doc, depth))
+                
+                # Extract attachment URLs from document text
+                text = doc.get('text', '')
+                if text:
+                    urls = self._extract_attachment_urls(text)
+                    all_attachment_urls.update(urls)
+                    
             except Exception as e:
                 print(f"    Warning: Could not fetch document: {e}", file=sys.stderr)
         
         # Build document UUID to anchor mapping
         self._build_doc_uuid_mapping(documents_with_content)
         
-        print(f"Generating HTML...")
+        # Setup output directory structure
+        output_path = Path(output_file)
+        if output_path.suffix == '.html':
+            # User specified an HTML file - create a directory structure
+            self.output_dir = output_path.parent / output_path.stem
+        else:
+            # User specified a directory
+            self.output_dir = output_path
+        
+        # Create output directory
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Download attachments if any were found
+        if all_attachment_urls:
+            print(f"\nFound {len(all_attachment_urls)} attachment(s) to download...")
+            attachments_dir = self.output_dir / "attachments"
+            attachments_dir.mkdir(exist_ok=True)
+            
+            for url in all_attachment_urls:
+                self._download_attachment(url, attachments_dir)
+        
+        print(f"\nGenerating HTML...")
         html = self._generate_html(collection_name, collection_description, documents_with_content)
         
-        print(f"Writing to {output_file}...")
-        with open(output_file, 'w', encoding='utf-8') as f:
+        # Replace attachment URLs with local paths in the final HTML
+        if self.downloaded_attachments:
+            html = self._replace_attachment_urls(html, is_html=True)
+        
+        # Write the HTML file to the output directory
+        html_file = self.output_dir / "index.html"
+        print(f"Writing to {html_file}...")
+        with open(html_file, 'w', encoding='utf-8') as f:
             f.write(html)
         
-        print(f"Done! Compiled {len(documents_with_content)} documents to {output_file}")
+        print(f"\nDone! Compiled {len(documents_with_content)} documents to {self.output_dir}/")
+        print(f"  - index.html (main document)")
+        if self.downloaded_attachments:
+            print(f"  - attachments/ ({len(self.downloaded_attachments)} file(s))")
     
     def _generate_html(self, collection_name: str, collection_description: str, 
                       documents: List[tuple]) -> str:
@@ -610,6 +914,9 @@ class OutlineCompiler:
             # Process Outline mention links after markdown conversion
             content_html = self._process_mention_links(content_html)
             
+            # Process file attachments to clean up formatting
+            content_html = self._process_file_attachments(content_html)
+            
             depth_class = f'depth-{depth}' if depth > 0 else ''
             
             html_parts.extend([
@@ -682,17 +989,22 @@ Examples:
   # Verify your API key works
   %(prog)s --verify-auth --api-key YOUR_API_KEY
   
-  # Using cloud-hosted Outline
+  # Using cloud-hosted Outline (creates outline_compilation/ directory with index.html and attachments/)
   %(prog)s --api-key YOUR_API_KEY --collection-id COLLECTION_UUID
   
-  # Using self-hosted Outline
+  # Using self-hosted Outline with custom output directory
   %(prog)s --api-url https://outline.example.com/api \\
            --api-key YOUR_API_KEY \\
            --collection-id COLLECTION_UUID \\
-           --output mycompilation.html
+           --output my_docs
   
   # Enable debug output
   %(prog)s --api-key YOUR_API_KEY --collection-id COLLECTION_UUID --debug
+
+Output Structure:
+  The script creates a directory containing:
+  - index.html: The compiled HTML document
+  - attachments/: Directory containing all downloaded attachments (images, files, etc.)
         """
     )
     
@@ -715,7 +1027,7 @@ Examples:
     parser.add_argument(
         '--output',
         default='outline_compilation.html',
-        help='Output HTML file path (default: outline_compilation.html)'
+        help='Output path (HTML file or directory). Will create a directory with index.html and attachments/ (default: outline_compilation.html)'
     )
     
     parser.add_argument(
