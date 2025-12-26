@@ -360,6 +360,13 @@ class OutlineCompiler:
         original_url = url
         url = url.strip()
         
+        # Remove anything after the first space-quote pattern (catches title attributes)
+        # This handles cases like: /api/attachments.redirect?id=xxx "left-50 =184x38
+        if ' "' in url:
+            url = url.split(' "')[0]
+        if " '" in url:
+            url = url.split(" '")[0]
+        
         # Remove markdown image size syntax (e.g., " =709x696" or "=709x696")
         url = re.sub(r'\s*=\s*\d+\s*x\s*\d+\s*$', '', url)
         
@@ -410,9 +417,12 @@ class OutlineCompiler:
                 urls.add(url)
         
         # Also check for direct HTML img tags in the markdown
-        html_img_pattern = r'<img[^>]+src=["\']([^"\'\']+)["\']'
+        # Extract src attribute value more carefully to avoid capturing title/other attributes
+        html_img_pattern = r'<img[^>]+src=["\']([^"\'\']+?)["\']'
         for match in re.finditer(html_img_pattern, text):
-            url = self._clean_url(match.group(1))
+            url = match.group(1).strip()
+            # Clean the URL - this will remove any trailing title attributes
+            url = self._clean_url(url)
             if self._is_attachment_url(url):
                 urls.add(url)
         
@@ -428,12 +438,20 @@ class OutlineCompiler:
         Returns:
             True if the URL appears to be an attachment
         """
-        # Skip mention:// protocol links
-        if url.startswith('mention://'):
+        # Skip mention:// protocol links (case-insensitive)
+        if url.lower().startswith('mention://'):
             return False
         
-        # Skip mailto: links
-        if url.startswith('mailto:'):
+        # Skip mailto: links (case-insensitive)
+        if url.lower().startswith('mailto:'):
+            return False
+        
+        # Skip tel: links (case-insensitive)
+        if url.lower().startswith('tel:'):
+            return False
+        
+        # Skip /doc/ document links (these are internal document references, not attachments)
+        if url.startswith('/doc/'):
             return False
         
         # Skip external http/https links that don't match our API domain
@@ -479,34 +497,80 @@ class OutlineCompiler:
             # Make sure the URL is clean before processing
             clean_url = self._clean_url(url)
             
-            # Convert relative URLs to absolute URLs
-            download_url = clean_url
-            if clean_url.startswith('/'):
-                # Relative URL - prepend the base URL (without /api suffix)
-                parsed_api = urlparse(self.api_url)
-                base_url = f"{parsed_api.scheme}://{parsed_api.netloc}"
-                download_url = base_url + clean_url
-                if self.debug:
-                    print(f"DEBUG: Converted relative URL {clean_url} to {download_url}", file=sys.stderr)
+            # Initialize redirect_response variable
+            redirect_response = None
             
-            # Generate a safe filename
-            parsed = urlparse(clean_url)
-            filename = os.path.basename(unquote(parsed.path))
-            
-            # For API endpoints like attachments.redirect, use the ID from query params
+            # Handle API attachments.redirect endpoint specially
             if 'attachments.redirect' in clean_url:
                 import urllib.parse
+                parsed = urlparse(clean_url)
                 query_params = urllib.parse.parse_qs(parsed.query)
                 if 'id' in query_params:
                     attachment_id = query_params['id'][0]
-                    # We'll get the actual filename from the response headers
+                    if self.debug:
+                        print(f"DEBUG: Detected attachments.redirect endpoint for ID: {attachment_id}", file=sys.stderr)
+                    
+                    # Use the API to get the actual redirect URL
+                    result = self._make_request('attachments.redirect', {'id': attachment_id})
+                    # The API should return a redirect URL in the response
+                    if self.debug:
+                        print(f"DEBUG: attachments.redirect API response: {result}", file=sys.stderr)
+                    
+                    # Check if we got a redirect URL in the response
+                    redirect_url = None
+                    if isinstance(result, dict):
+                        # Try to find the redirect URL in various possible response formats
+                        redirect_url = result.get('url') or result.get('data', {}).get('url')
+                    
+                    if redirect_url:
+                        # Use the redirect URL as our download URL
+                        download_url = redirect_url
+                        if self.debug:
+                            print(f"DEBUG: Got redirect URL from API: {download_url}", file=sys.stderr)
+                        
+                        # Try downloading from the redirect URL
+                        response = requests.get(download_url, stream=True, timeout=30, allow_redirects=True)
+                        
+                        # Check for 404 specifically - this means the file was deleted
+                        if response.status_code == 404:
+                            raise Exception(f"Attachment file not found on server (404). The file may have been deleted from storage.")
+                        
+                        response.raise_for_status()
+                        
+                        # If successful, we'll use this response later
+                        redirect_response = response
+                    else:
+                        # If API didn't return a URL, we can't download the attachment
+                        raise Exception("API did not return a redirect URL for attachment")
+                    
+                    # Generate initial filename based on attachment ID
                     filename = f"attachment_{attachment_id[:8]}"
-            
-            # If no filename, generate one from the URL
-            if not filename or filename == '/':
-                import hashlib
-                url_hash = hashlib.md5(clean_url.encode()).hexdigest()[:8]
-                filename = f"attachment_{url_hash}"
+                else:
+                    # No ID in query params, shouldn't happen but handle it
+                    download_url = clean_url
+                    import hashlib
+                    url_hash = hashlib.md5(clean_url.encode()).hexdigest()[:8]
+                    filename = f"attachment_{url_hash}"
+            else:
+                # Convert relative URLs to absolute URLs
+                download_url = clean_url
+                if clean_url.startswith('/'):
+                    # Relative URL - prepend the base URL (without /api suffix)
+                    parsed_api = urlparse(self.api_url)
+                    base_url = f"{parsed_api.scheme}://{parsed_api.netloc}"
+                    download_url = base_url + clean_url
+                    if self.debug:
+                        print(f"DEBUG: Converted relative URL {clean_url} to {download_url}", file=sys.stderr)
+                
+                # Generate a safe filename
+                parsed = urlparse(clean_url)
+                filename = os.path.basename(unquote(parsed.path))
+                
+                # If no filename, generate one from the URL
+                if not filename or filename == '/':
+                    import hashlib
+                    url_hash = hashlib.md5(clean_url.encode()).hexdigest()[:8]
+                    filename = f"attachment_{url_hash}"
             
             # Ensure filename is safe
             filename = re.sub(r'[^\w\s\-\.]', '_', filename)
@@ -525,16 +589,24 @@ class OutlineCompiler:
             if self.debug:
                 print(f"DEBUG: Using download URL: {download_url}", file=sys.stderr)
             
-            # Use the API key for authentication if it's an API endpoint
-            headers = {}
-            if '/api/attachments' in download_url:
-                headers = self.headers
-                if self.debug:
-                    print(f"DEBUG: Using API authentication headers", file=sys.stderr)
+            # Use the API key for authentication
+            headers = self.headers.copy()
+            # For direct file downloads (not API endpoints), we may not need auth
+            # but it doesn't hurt to include it
             
-            # Allow redirects for attachments.redirect endpoint
-            response = requests.get(download_url, headers=headers, stream=True, timeout=30, allow_redirects=True)
-            response.raise_for_status()
+            # Download the file (may have already been downloaded if we got a redirect URL)
+            if 'redirect_response' in locals() and redirect_response is not None:
+                response = redirect_response
+            else:
+                response = requests.get(download_url, headers=headers, stream=True, timeout=30, allow_redirects=True)
+                response.raise_for_status()
+            
+            # Check if we got HTML instead of a file (indicates an error)
+            content_type = response.headers.get('Content-Type', '')
+            if 'text/html' in content_type:
+                if self.debug:
+                    print(f"DEBUG: Received HTML instead of file, Content-Type: {content_type}", file=sys.stderr)
+                raise Exception(f"Received HTML page instead of file (Content-Type: {content_type})")
             
             # Try to get a better filename from Content-Disposition header
             if 'Content-Disposition' in response.headers:
@@ -543,11 +615,17 @@ class OutlineCompiler:
                 filename_match = regex.search(r'filename[^;=\n]*=["\']?([^"\';\n]+)', content_disp)
                 if filename_match:
                     suggested_filename = filename_match.group(1)
-                    # Use the extension from the suggested filename if we don't have one
+                    # Use the suggested filename if we have a generic one
                     if not ext and '.' in suggested_filename:
                         ext = '.' + suggested_filename.rsplit('.', 1)[1]
                         filename = base_name + ext
                         final_path = attachments_dir / filename
+                        # Re-check uniqueness with new extension
+                        counter = 1
+                        while final_path.exists():
+                            filename = f"{base_name}_{counter}{ext}"
+                            final_path = attachments_dir / filename
+                            counter += 1
             
             # Save the file
             with open(final_path, 'wb') as f:
@@ -563,6 +641,9 @@ class OutlineCompiler:
             
         except Exception as e:
             print(f"  Warning: Failed to download attachment from {url}: {e}", file=sys.stderr)
+            if self.debug:
+                import traceback
+                traceback.print_exc()
             return None
     
     def _replace_attachment_urls(self, text: str, is_html: bool = False) -> str:
