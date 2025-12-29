@@ -297,7 +297,11 @@ class OutlineCompiler:
         """
         Convert Outline mention:// protocol links to internal document anchors.
         
-        Outline uses: @<a href="mention://[UUID]/document/[UUID]">Document Name</a>
+        Outline uses various formats for document links:
+        - @<a href="mention://[UUID]/document/[UUID]">Document Name</a>
+        - <a href="mention://[UUID]/doc/[UUID]">Document Name</a>
+        - <a href="/doc/[UUID]">Document Name</a>
+        
         We convert to: <a href="#doc-{i}">Document Name</a>
         
         Args:
@@ -306,9 +310,6 @@ class OutlineCompiler:
         Returns:
             HTML with mention:// links converted to internal anchors
         """
-        # Pattern to match: @<a href="mention://[UUID]/document/[UUID]">...</a>
-        pattern = r'@<a href="mention://[^/]+/document/([^"]+)">([^<]+)</a>'
-        
         def replace_mention(match):
             doc_uuid = match.group(1)
             doc_name = match.group(2)
@@ -322,7 +323,19 @@ class OutlineCompiler:
                 # If document not found in compilation, keep the name but make it non-clickable
                 return f'<span class="mention-link-missing" title="Document not in compilation: {doc_name}">{doc_name}</span>'
         
-        return re.sub(pattern, replace_mention, html)
+        # Pattern 1: @<a href="mention://[UUID]/document/[UUID]">...</a>
+        pattern1 = r'@<a href="mention://[^/]+/document/([^"]+)">([^<]+)</a>'
+        html = re.sub(pattern1, replace_mention, html)
+        
+        # Pattern 2: <a href="mention://[UUID]/doc/[UUID]">...</a> (without @)
+        pattern2 = r'<a href="mention://[^/]+/doc/([^"]+)">([^<]+)</a>'
+        html = re.sub(pattern2, replace_mention, html)
+        
+        # Pattern 3: <a href="/doc/[UUID]">...</a>
+        pattern3 = r'<a href="/doc/([a-f0-9\-]{36})">([^<]+)</a>'
+        html = re.sub(pattern3, replace_mention, html)
+        
+        return html
     
     def _process_file_attachments(self, html: str) -> str:
         """
@@ -510,38 +523,35 @@ class OutlineCompiler:
                     if self.debug:
                         print(f"DEBUG: Detected attachments.redirect endpoint for ID: {attachment_id}", file=sys.stderr)
                     
-                    # Use the API to get the actual redirect URL
-                    result = self._make_request('attachments.redirect', {'id': attachment_id})
-                    # The API should return a redirect URL in the response
+                    # The attachments.redirect endpoint returns an HTTP redirect, not JSON
+                    # Make a POST request and follow redirects to download the file
+                    api_endpoint_url = f"{self.api_url}/attachments.redirect"
+                    
                     if self.debug:
-                        print(f"DEBUG: attachments.redirect API response: {result}", file=sys.stderr)
+                        print(f"DEBUG: Calling attachments.redirect for ID: {attachment_id}", file=sys.stderr)
                     
-                    # Check if we got a redirect URL in the response
-                    redirect_url = None
-                    if isinstance(result, dict):
-                        # Try to find the redirect URL in various possible response formats
-                        redirect_url = result.get('url') or result.get('data', {}).get('url')
+                    # POST to the API endpoint with allow_redirects=True to follow the redirect
+                    response = requests.post(
+                        api_endpoint_url,
+                        headers=self.headers,
+                        json={'id': attachment_id},
+                        stream=True,
+                        timeout=30,
+                        allow_redirects=True
+                    )
                     
-                    if redirect_url:
-                        # Use the redirect URL as our download URL
-                        download_url = redirect_url
-                        if self.debug:
-                            print(f"DEBUG: Got redirect URL from API: {download_url}", file=sys.stderr)
-                        
-                        # Try downloading from the redirect URL
-                        response = requests.get(download_url, stream=True, timeout=30, allow_redirects=True)
-                        
-                        # Check for 404 specifically - this means the file was deleted
-                        if response.status_code == 404:
-                            raise Exception(f"Attachment file not found on server (404). The file may have been deleted from storage.")
-                        
-                        response.raise_for_status()
-                        
-                        # If successful, we'll use this response later
-                        redirect_response = response
-                    else:
-                        # If API didn't return a URL, we can't download the attachment
-                        raise Exception("API did not return a redirect URL for attachment")
+                    if self.debug:
+                        print(f"DEBUG: Response status: {response.status_code}", file=sys.stderr)
+                        print(f"DEBUG: Final URL after redirects: {response.url}", file=sys.stderr)
+                    
+                    # Check for 404 specifically - this means the file was deleted
+                    if response.status_code == 404:
+                        raise Exception(f"Attachment file not found on server (404). The file may have been deleted from storage.")
+                    
+                    response.raise_for_status()
+                    
+                    # If successful, we'll use this response later
+                    redirect_response = response
                     
                     # Generate initial filename based on attachment ID
                     filename = f"attachment_{attachment_id[:8]}"
