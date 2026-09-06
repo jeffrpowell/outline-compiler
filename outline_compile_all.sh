@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 #
 # outline_compile_all.sh — cron entrypoint for the Outline document compiler.
 #
