@@ -1,0 +1,14 @@
+# One collection per line:   <slug>  <collection-id>
+#
+#   slug           output folder name under OUTLINE_EXPORT_DIR
+#                  (lowercase, no spaces; this is what you'll open later)
+#   collection-id  the UUID from your Outline collection URL:
+#                  https://app.getoutline.com/collection/<collection-id>
+#
+# Separate the slug and the id with one or more spaces or tabs.
+# Lines starting with '#' and blank lines are ignored.
+#
+# Examples (uncomment and fill in your real values):
+# product-docs   3f2a1b9c-0d4e-4a6b-8c7d-1e2f3a4b5c6d
+# engineering    9b1c2d3e-4f5a-4b6c-8d7e-2f3a4b5c6d7e
+# onboarding     00112233-4455-6677-8899-aabbccddeeff

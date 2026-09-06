@@ -42,6 +42,13 @@ env/
 .env
 .env.local
 
+# Per-instance compiler config (see collections.example.txt)
+collections.txt
+
+# Cron runner
+logs/
+.cron.lock
+
 # API keys and secrets
 *.key
 secrets.txt
