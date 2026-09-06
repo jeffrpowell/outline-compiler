@@ -46,19 +46,61 @@ if command -v flock >/dev/null 2>&1; then
     fi
 fi
 
-# --- Python environment: reuse .venv, or bootstrap it on first run ---
+# --- Python environment: .venv must be able to import the compiler's deps.
+#     A missing venv, a venv copied from another machine, or one created
+#     without the packages (e.g. `python3 -m venv` on a distro whose venv
+#     ships no pip) are all detected and repaired here.
 PY="$REPO/.venv/bin/python"
-if [ ! -x "$PY" ]; then
-    echo "[$(date -Is)] no .venv found — bootstrapping (first run)"
+
+deps_ok() {
+    "$PY" -c "import requests, markdown" >/dev/null 2>&1
+}
+
+install_deps() {
     if command -v uv >/dev/null 2>&1; then
-        uv venv .venv && uv pip install --python .venv/bin/python -r requirements.txt
+        uv pip install --python "$PY" -r requirements.txt
+    elif "$PY" -m pip --version >/dev/null 2>&1; then
+        "$PY" -m pip install -r requirements.txt
     else
-        python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+        "$PY" -m ensurepip --upgrade && "$PY" -m pip install -r requirements.txt
     fi
-    if [ ! -x "$PY" ]; then
-        echo "[$(date -Is)] FATAL: could not create .venv in $REPO"
-        exit 1
+}
+
+recreate_venv() {
+    rm -rf .venv
+    if command -v uv >/dev/null 2>&1; then
+        uv venv .venv
+    else
+        python3 -m venv .venv
     fi
+}
+
+if [ ! -x "$PY" ]; then
+    echo "[$(date -Is)] no .venv — creating it"
+    recreate_venv || true
+fi
+
+if ! deps_ok; then
+    echo "[$(date -Is)] dependencies missing in .venv — installing"
+    install_deps || true
+fi
+
+if ! deps_ok; then
+    # Install-in-place failed (or the venv is broken/copied). Rebuild from
+    # scratch once, then give up with a clear message.
+    echo "[$(date -Is)] install did not stick — rebuilding .venv from scratch"
+    recreate_venv && install_deps || true
+fi
+
+if ! deps_ok; then
+    echo "[$(date -Is)] FATAL: 'requests'/'markdown' still not importable after a full rebuild."
+    echo "  The install output above shows why (network? proxy? disk space?)."
+    if command -v uv >/dev/null 2>&1; then
+        echo "  Manual fix: uv pip install --python .venv/bin/python -r requirements.txt"
+    else
+        echo "  Manual fix: .venv/bin/python -m pip install -r requirements.txt"
+    fi
+    exit 1
 fi
 
 # --- compile every configured collection ---
